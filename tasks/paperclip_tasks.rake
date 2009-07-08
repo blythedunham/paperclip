@@ -14,23 +14,96 @@ def obtain_attachments
   end
 end
 
-def for_all_attachments
+def set_logger
+  #configure ActiveRecord to log to Stdout
+  if (log = (ENV['LOG']||ENV['log'])) && log.to_s.downcase != 'false'
+    ActiveRecord::Base.logger = Logger.new(STDOUT)
+    ActiveRecord::Base.logger.level = begin
+      log =~ /^\d*$/ ? log.to_i : Logger.const_get(log.upcase)
+    rescue
+      Logger::INFO
+    end
+    puts "ActiveRecord to STDOUT level #{ActiveRecord::Base.logger.level}"
+    ActiveRecord::Base.connection.instance_variable_set('@logger', ActiveRecord::Base.logger)
+    Paperclip.options[:log] = true
+  end
+end
+
+def obtain_settings
+  @verbose = (ENV['VERBOSE']||ENV['verbose']).to_s.downcase == 'true'
+  @skip_errors = (ENV['skip_errors']||ENV['SKIP_ERRORS']).to_s.downcase == 'true'
+  print_message("Verbose: #{@verbose}, Skipping Errors #{@skipping_errors}", true)
+  set_logger
+end
+
+# Add the error to the list if we are tracking errors
+# Print the error out now when in verbose mode
+def add_error(id, name, error_message, additional_message)
+  if @errors
+    @errors[name]||= []
+    @errors[name] << [ id, error_message ]
+  end
+  print_message("#{name} #{id}: #{error_message} #{additional_message}", true)
+end
+
+#print a message to stdout. If verbose param is set, only log if in @verbose mode
+def print_message(message, verbose=false)
+  if !verbose || @verbose
+    print "#{message}\n"
+    $stdout.flush
+  end
+end
+
+def success_message(result, id)
+  message = if @verbose
+   "#{id}: #{result ? 'success' : 'error!'}"
+  else
+    result ? "." : "x"
+  end
+end
+
+def print_all_errors
+  @errors.each do |(name, e)|
+    print_message("-----#{name} ERRORS-------")
+    print_message(@errors[name].collect{|e| "#{e.first}: #{e.last}"}.join("\n"))
+    print_message("-----#{name} ERROR IDS----\n#{@errors[name].collect(&:first).join(", ")}")
+  end
+  @errors = nil
+end
+
+def for_all_attachments(options={})
+  obtain_settings
   klass = obtain_class
   names = obtain_attachments
-  ids   = klass.connection.select_values(klass.send(:construct_finder_sql, :select => 'id'))
+  @errors = {} if @verbose || options[:track_errors]
+
+  sql = klass.send(:construct_finder_sql, :select => 'id')
+  sql << " #{ENV['SQL']||ENV['sql']}" if ENV['SQL']
+  sql << " WHERE id = #{ENV['id']||ENV['ID']}" if ENV['id']||ENV['ID']
+  ids = klass.connection.select_values(sql)
 
   ids.each do |id|
-    instance = klass.find(id)
+    instance = klass.find_by_id(id)
+    next unless instance
     names.each do |name|
-      result = if instance.send("#{ name }?")
-                 yield(instance, name)
-               else
-                 true
-               end
-      print result ? "." : "x"; $stdout.flush
+      begin
+        print_message "#{id}: Start #{name}", true
+        result = if instance.send("#{ name }?")
+          yield(instance, name)
+        else
+          true
+        end
+      rescue => e
+        add_error(id, name, e.inspect, ("\n#{e.backtrace.join("\n")}" if e.backtrace))
+        raise e unless @skip_errors
+        result = false
+      end
+      print_message(success_message(result, id))
+      add_error(id, name, instance.errors.full_messages.inspect) if instance && !instance.errors.blank?
     end
   end
-  puts " Done."
+  print_message " Done."
+  print_all_errors
 end
 
 namespace :paperclip do
@@ -40,13 +113,9 @@ namespace :paperclip do
   namespace :refresh do
     desc "Regenerates thumbnails for a given CLASS (and optional ATTACHMENT)."
     task :thumbnails => :environment do
-      errors = []
-      for_all_attachments do |instance, name|
-        result = instance.send(name).reprocess!
-        errors << [instance.id, instance.errors] unless instance.errors.blank?
-        result
+      for_all_attachments(:track_errors => true) do |instance, name|
+        instance.send(name).reprocess!
       end
-      errors.each{|e| puts "#{e.first}: #{e.last.full_messages.inspect}" }
     end
 
     desc "Regenerates content_type/size metadata for a given CLASS (and optional ATTACHMENT)."
@@ -71,6 +140,9 @@ namespace :paperclip do
       if instance.send(name).valid?
         true
       else
+        if @verbose && instance.errors.any?
+          add_error(instance.id, name, "Cleaning invalid record: #{instance.errors.full_messages.inspect}")
+        end
         instance.send("#{name}=", nil)
         instance.save
       end
